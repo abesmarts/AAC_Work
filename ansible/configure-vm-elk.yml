@@ -1,0 +1,269 @@
+---
+- name: Configure Ubuntu VM with SSH, Chrome, Python Scripts and ELK Integration
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    elk_server_ip: "host.docker.internal"
+    logstash_port: 5044
+    logstash_tcp_port: 5000
+    filebeat_version: "8.11.0"
+    python_scripts_dir: "/opt/python-scripts"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install essential packages
+      apt:
+        name:
+          - openssh-server
+          - curl
+          - wget
+          - gnupg
+          - software-properties-common
+          - apt-transport-https
+          - ca-certificates
+          - rsyslog
+          - python3
+          - python3-pip
+          - python3-venv
+        state: present
+
+    - name: Configure SSH
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^#?PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+      notify: restart ssh
+
+    - name: Install Google Chrome
+      block:
+        - name: Add Google Chrome repository key
+          apt_key:
+            url: https://dl.google.com/linux/linux_signing_key.pub
+            state: present
+
+        - name: Add Google Chrome repository
+          apt_repository:
+            repo: "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main"
+            state: present
+            filename: google-chrome
+
+        - name: Install Google Chrome
+          apt:
+            name: google-chrome-stable
+            state: present
+            update_cache: yes
+
+    - name: Create Python scripts directory
+      file:
+        path: "{{ python_scripts_dir }}"
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Copy Python requirements file
+      copy:
+        src: ../python-scripts/requirements.txt
+        dest: "{{ python_scripts_dir }}/requirements.txt"
+        mode: '0644'
+
+    - name: Copy Python data collector script
+      copy:
+        src: ../python-scripts/data_collector.py
+        dest: "{{ python_scripts_dir }}/data_collector.py"
+        mode: '0755'
+
+    - name: Copy Python system monitor script
+      copy:
+        src: ../python-scripts/system_monitor.py
+        dest: "{{ python_scripts_dir }}/system_monitor.py"
+        mode: '0755'
+
+    - name: Install Python dependencies
+      pip:
+        requirements: "{{ python_scripts_dir }}/requirements.txt"
+        state: present
+        executable: pip3
+
+    - name: Create systemd service for data collector
+      copy:
+        content: |
+          [Unit]
+          Description=VM Data Collector for ELK Stack
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          ExecStart=/usr/bin/python3 {{ python_scripts_dir }}/data_collector.py {{ elk_server_ip }} 60
+          Restart=always
+          RestartSec=10
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/data-collector.service
+        mode: '0644'
+      notify: reload systemd
+
+    - name: Create systemd service for system monitor
+      copy:
+        content: |
+          [Unit]
+          Description=VM System Monitor for ELK Stack
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          ExecStart=/usr/bin/python3 {{ python_scripts_dir }}/system_monitor.py {{ elk_server_ip }} 30
+          Restart=always
+          RestartSec=10
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/system-monitor.service
+        mode: '0644'
+      notify: reload systemd
+
+    - name: Install Filebeat
+      block:
+        - name: Add Elastic repository key
+          apt_key:
+            url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+            state: present
+
+        - name: Add Elastic repository
+          apt_repository:
+            repo: "deb https://artifacts.elastic.co/packages/8.x/apt stable main"
+            state: present
+            filename: elastic-8.x
+
+        - name: Install Filebeat
+          apt:
+            name: filebeat
+            state: present
+            update_cache: yes
+
+    - name: Configure Filebeat
+      copy:
+        content: |
+          filebeat.inputs:
+          - type: filestream
+            id: vm-system-logs
+            paths:
+              - /var/log/syslog
+              - /var/log/auth.log
+              - /var/log/kern.log
+            fields:
+              log_type: vm-system
+              vm_name: "{{ inventory_hostname }}"
+            fields_under_root: true
+
+          - type: filestream
+            id: vm-application-logs
+            paths:
+              - /var/log/applications/*.log
+            fields:
+              log_type: vm-application
+              vm_name: "{{ inventory_hostname }}"
+            fields_under_root: true
+
+          - type: filestream
+            id: python-script-logs
+            paths:
+              - /var/log/applications/data_collector.log
+              - /var/log/applications/system_alerts.log
+            fields:
+              log_type: python-scripts
+              vm_name: "{{ inventory_hostname }}"
+            fields_under_root: true
+
+          output.logstash:
+            hosts: ["{{ elk_server_ip }}:{{ logstash_port }}"]
+
+          processors:
+          - add_host_metadata:
+              when.not.contains.tags: forwarded
+
+          logging.level: info
+          logging.to_files: true
+          logging.files:
+            path: /var/log/filebeat
+            name: filebeat
+            keepfiles: 7
+            permissions: 0644
+        dest: /etc/filebeat/filebeat.yml
+        owner: root
+        group: root
+        mode: '0600'
+      notify: restart filebeat
+
+    - name: Create application logs directory
+      file:
+        path: /var/log/applications
+        state: directory
+        mode: '0755'
+
+    - name: Configure rsyslog for ELK forwarding
+      blockinfile:
+        path: /etc/rsyslog.d/49-elk.conf
+        create: yes
+        block: |
+          # Forward logs to ELK stack
+          *.* @@{{ elk_server_ip }}:{{ logstash_tcp_port }}
+        marker: "# {mark} ELK forwarding configuration"
+      notify: restart rsyslog
+
+    - name: Start and enable services
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - ssh
+        - filebeat
+        - rsyslog
+        - data-collector
+        - system-monitor
+
+    - name: Run data collector once to test
+      command: /usr/bin/python3 {{ python_scripts_dir }}/data_collector.py {{ elk_server_ip }} --once
+      register: data_collector_output
+
+    - name: Display data collector output
+      debug:
+        var: data_collector_output.stdout_lines
+
+  handlers:
+    - name: restart ssh
+      systemd:
+        name: ssh
+        state: restarted
+
+    - name: restart filebeat
+      systemd:
+        name: filebeat
+        state: restarted
+
+    - name: restart rsyslog
+      systemd:
+        name: rsyslog
+        state: restarted
+
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes

@@ -1,0 +1,32 @@
+{
+  "name": "Configure VM with ELK Integration",
+  "type": "ansible",
+  "playbook": "configure-vm-elk.yml",
+  "repository_id": 1,
+  "inventory_id": 1,
+  "environment_id": 1,
+  "vault_id": null,
+  "description": "Configures Ubuntu VM with SSH, Chrome, and Filebeat for ELK integration",
+  "arguments": [
+    "--ssh-common-args='-o StrictHostKeyChecking=no'"
+  ],
+  "allow_override_args_in_task": true,
+  "suppress_success_alerts": false,
+  "survey_vars": [
+    {
+      "name": "target_host",
+      "title": "Target Host IP",
+      "description": "IP address of the VM to configure",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "elk_server_ip",
+      "title": "ELK Server IP",
+      "description": "IP address of the ELK stack server",
+      "type": "string",
+      "required": true,
+      "default": "host.docker.internal"
+    }
+  ]
+}
